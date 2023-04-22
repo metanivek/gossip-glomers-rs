@@ -225,10 +225,6 @@ impl<F, T> Handler<T> for F where F: Fn(&mut NodeNet<T>, &mut T, &Request) -> Re
 pub trait CustomEventHandler<T, C>: Fn(&mut NodeNet<T>, &mut T, C) -> Result {}
 impl<F, T, C> CustomEventHandler<T, C> for F where F: Fn(&mut NodeNet<T>, &mut T, C) -> Result {}
 
-/// Init handler for a `Node`
-pub trait InitHandler<T>: Fn(&mut T, &NodeId, &[NodeId]) {}
-impl<F, T> InitHandler<T> for F where F: Fn(&mut T, &NodeId, &[NodeId]) {}
-
 /// Reply handler for a `Node` when it calls `send`
 pub trait ReplyHandler<T>: Fn(&mut T) -> Result {}
 impl<F, T> ReplyHandler<T> for F where F: Fn(&mut T) -> Result {}
