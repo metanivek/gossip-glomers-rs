@@ -1,33 +1,237 @@
-use anyhow::{Context, Error};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::io::{stdin, stdout, BufRead, Write};
+
+/// Maelstrom errors
+/// https://github.com/jepsen-io/maelstrom/blob/main/resources/errors.edn
+#[repr(u16)]
+#[derive(Debug, Clone, Copy)]
+pub enum MaelstromCode {
+    /// Indicates that the requested operation could not be completed within a timeout.
+    Timeout = 0,
+    /// Thrown when a client sends an RPC request to a node which does not exist.
+    NodeNotFound = 1,
+    /// "Use this error to indicate that a requested operation is not supported by
+    /// the current implementation. Helpful for stubbing out APIs during development.
+    NotSupported = 10,
+    /// Indicates that the operation definitely cannot be performed at this time--perhaps
+    /// because the server is in a read-only state, has not yet been initialized, believes
+    /// its peers to be down, and so on. Do *not* use this error for indeterminate cases,
+    /// when the operation may actually have taken place.
+    TemporarilyUnavailable = 11,
+    /// The client's request did not conform to the server's expectations, and could not
+    /// possibly have been processed.
+    MalformedRequest = 12,
+    /// Indicates that some kind of general, indefinite error occurred. Use this
+    /// as a catch-all for errors you can't otherwise categorize, or as a starting
+    /// point for your error handler: it's safe to return `crash` for every
+    /// problem by default, then add special cases for more specific errors later.
+    Crash = 13,
+    /// Indicates that some kind of general, definite error occurred. Use this as a
+    /// catch-all for errors you can't otherwise categorize, when you specifically
+    /// know that the requested operation has not taken place. For instance, you might
+    /// encounter an indefinite failure during the prepare phase of a transaction: since
+    /// you haven't started the commit process yet, the transaction can't have taken place.
+    /// It's therefore safe to return a definite `abort` to the client.
+    Abort = 14,
+    /// The client requested an operation on a key which does not exist (assuming the
+    /// operation should not automatically create missing keys).
+    KeyDoesNotExist = 20,
+    /// The client requested the creation of a key which already exists, and the server will
+    /// not overwrite it.
+    KeyAlreadyExists = 21,
+    /// The requested operation expected some conditions to hold, and those conditions
+    /// were not met. For instance, a compare-and-set operation might assert that the
+    /// value of a key is currently 5; if the value is 3, the server would return
+    /// `precondition-failed`.
+    PreconditionFailed = 22,
+    /// The requested transaction has been aborted because of a conflict with another
+    /// transaction. Servers need not return this error on every conflict: they may choose
+    /// to retry automatically instead.
+    TxnConflict = 30,
+}
+
+impl From<MaelstromCode> for u16 {
+    fn from(value: MaelstromCode) -> Self {
+        value as u16
+    }
+}
+
+impl<C> From<MaelstromCode> for Event<C> {
+    fn from(value: MaelstromCode) -> Self {
+        Event::MaelstromError(value)
+    }
+}
+
+impl Display for MaelstromCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use MaelstromCode::*;
+        let msg = match self {
+            Timeout => "request timed out",
+            NodeNotFound => "node does not exist",
+            NotSupported => "request not supported",
+            TemporarilyUnavailable => "node unavailable",
+            MalformedRequest => "malformed request",
+            Crash => "node crash with unspecified, indefinite error",
+            Abort => "node abort with unspecified, definite error",
+            KeyDoesNotExist => "key does not exist",
+            KeyAlreadyExists => "key already exists",
+            PreconditionFailed => "precondition failed",
+            TxnConflict => "transation aborted because of conflict",
+        };
+        let code = *self as u16;
+
+        write!(f, "{} ({})", msg, code)
+    }
+}
+
+#[derive(Debug)]
+pub enum ErrorCode {
+    Maelstrom(MaelstromCode),
+    Custom(u16),
+}
+
+impl From<ErrorCode> for u16 {
+    fn from(value: ErrorCode) -> Self {
+        use ErrorCode::*;
+
+        match value {
+            Maelstrom(c) => c.into(),
+            Custom(c) => c,
+        }
+    }
+}
+
+impl Display for ErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use ErrorCode::*;
+        match self {
+            Maelstrom(c) => write!(f, "{}", c),
+            Custom(c) => write!(f, "custom error ({})", c),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Error {
+    code: ErrorCode,
+    text: Option<String>,
+    source: Option<Box<dyn std::error::Error + 'static>>,
+    // TODO: support extra key-value data in an error
+}
+
+impl Error {
+    pub fn new(code: ErrorCode) -> Self {
+        Self {
+            code,
+            text: None,
+            source: None,
+        }
+    }
+
+    pub fn custom(code: u16) -> Self {
+        Self::new(ErrorCode::Custom(code))
+    }
+
+    pub fn maelstrom(code: MaelstromCode) -> Self {
+        Self::new(ErrorCode::Maelstrom(code))
+    }
+
+    pub fn text(mut self, text: &str) -> Self {
+        self.text = Some(text.to_owned());
+        self
+    }
+
+    pub fn source<E>(mut self, source: E) -> Self
+    where
+        E: std::error::Error + 'static,
+    {
+        self.source = Some(Box::new(source));
+        self
+    }
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text_part = self
+            .text
+            .as_ref()
+            .map_or("".to_owned(), |t| format!(" | {}", t));
+        write!(f, "{}{}", self.code, text_part)
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_deref()
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::maelstrom(MaelstromCode::Crash).source(value)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Self::maelstrom(MaelstromCode::Crash).source(value)
+    }
+}
+
+/// An error message body
+#[derive(Serialize, Debug)]
+struct ErrorBody {
+    code: u16,
+    text: Option<String>,
+}
+
+impl From<Error> for ErrorBody {
+    fn from(value: Error) -> Self {
+        Self {
+            code: value.code.into(),
+            text: value.text,
+        }
+    }
+}
+
+pub type Result = std::result::Result<(), Error>;
+
+/// Simple log trait to make some code a little nicer
+trait Log {
+    fn log(&self, ctx: &str);
+}
+
+impl Log for Result {
+    fn log(&self, ctx: &str) {
+        if let Err(e) = self {
+            eprintln!("{} error'd: {}", ctx, e)
+        }
+    }
+}
 
 /// The ID of a node in a Maelstrom network
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeId(pub String);
 
 /// Request handler for a `Node`
-pub trait Handler<T>: Fn(&mut NodeNet<T>, &mut T, &Request) -> Result<(), Error> {}
-impl<F, T> Handler<T> for F where F: Fn(&mut NodeNet<T>, &mut T, &Request) -> Result<(), Error> {}
+pub trait Handler<T>: Fn(&mut NodeNet<T>, &mut T, &Request) -> Result {}
+impl<F, T> Handler<T> for F where F: Fn(&mut NodeNet<T>, &mut T, &Request) -> Result {}
 
 /// Custom event handler a `Node`
-pub trait CustomEventHandler<T, C>: Fn(&mut NodeNet<T>, &mut T, C) -> Result<(), Error> {}
-impl<F, T, C> CustomEventHandler<T, C> for F where
-    F: Fn(&mut NodeNet<T>, &mut T, C) -> Result<(), Error>
-{
-}
+pub trait CustomEventHandler<T, C>: Fn(&mut NodeNet<T>, &mut T, C) -> Result {}
+impl<F, T, C> CustomEventHandler<T, C> for F where F: Fn(&mut NodeNet<T>, &mut T, C) -> Result {}
 
 /// Init handler for a `Node`
 pub trait InitHandler<T>: Fn(&mut T, &NodeId, &[NodeId]) {}
 impl<F, T> InitHandler<T> for F where F: Fn(&mut T, &NodeId, &[NodeId]) {}
 
 /// Reply handler for a `Node` when it calls `send`
-pub trait ReplyHandler<T>: Fn(&mut T) -> Result<(), Error> {}
-impl<F, T> ReplyHandler<T> for F where F: Fn(&mut T) -> Result<(), Error> {}
+pub trait ReplyHandler<T>: Fn(&mut T) -> Result {}
+impl<F, T> ReplyHandler<T> for F where F: Fn(&mut T) -> Result {}
 
 /// A node capable of being run by maelstrom
 pub struct Node<T, C>
@@ -59,7 +263,7 @@ impl<T> NodeNet<T> {
     }
 
     /// Handles the maelstrom initialization message
-    fn handle_init(&mut self, request: &InitRequest) -> Result<(), Error> {
+    fn handle_init(&mut self, request: &InitRequest) -> Result {
         let request = &request.0;
         let msg: InitMessage = request.from_data()?;
         self.id = msg.node_id;
@@ -68,14 +272,28 @@ impl<T> NodeNet<T> {
     }
 
     /// Reply to a `request` with a simple acknowledgement
-    pub fn ack(&mut self, request: &Request) -> Result<(), Error> {
+    pub fn ack(&mut self, request: &Request) -> Result {
         self.reply(request, Map::new())
     }
 
     /// Reply to a `request` with a `body`
-    pub fn reply<B: Serialize + Debug>(&mut self, request: &Request, body: B) -> Result<(), Error> {
+    pub fn reply<B: Serialize + Debug>(&mut self, request: &Request, body: B) -> Result {
         let mut out = stdout();
         self.reply_out(request, body, &mut out)
+    }
+
+    /// Reply to a `requst` with an `error`
+    pub fn reply_err(&mut self, request: &Request, error: Error) -> Result {
+        let mut out = stdout();
+        let body: ErrorBody = error.into();
+        let reply_body = ReplyBody {
+            msg_id: self.increment_msg_id(),
+            msg_type: "error",
+            in_reply_to: request.body.msg_id,
+            body,
+        };
+        let dest = &request.src;
+        self.send_out(dest, reply_body, &mut out)
     }
 
     /// Send `body` to destination node
@@ -85,7 +303,7 @@ impl<T> NodeNet<T> {
         msg_type: &str,
         body: B,
         cb: F,
-    ) -> Result<(), Error> {
+    ) -> Result {
         let mut out = stdout();
         let send_body = SendBody {
             msg_id: self.increment_msg_id(),
@@ -101,12 +319,11 @@ impl<T> NodeNet<T> {
     /// Handles reply to this node from the network
     ///
     /// Calls a reply calllback if it was previously registered
-    fn handle_reply(&mut self, request: &ReplyRequest, state: &mut T) -> Result<(), Error> {
-        let in_reply_to = request
-            .0
-            .body
-            .in_reply_to
-            .expect("reply request missing in_reply_to");
+    fn handle_reply(&mut self, request: &ReplyRequest, state: &mut T) -> Result {
+        let in_reply_to = request.0.body.in_reply_to.ok_or_else(|| {
+            Error::maelstrom(MaelstromCode::MalformedRequest)
+                .text("reply request missing in_reply_to")
+        })?;
         if let Some(cb) = self.replies.get(&in_reply_to) {
             cb(state)?;
         }
@@ -126,10 +343,10 @@ impl<T> NodeNet<T> {
         request: &Request,
         body: B,
         out: &mut W,
-    ) -> Result<(), Error> {
+    ) -> Result {
         let reply_body = ReplyBody {
             msg_id: self.increment_msg_id(),
-            msg_type: request.body.msg_type.clone() + "_ok",
+            msg_type: &(request.body.msg_type.clone() + "_ok"),
             in_reply_to: request.body.msg_id,
             body,
         };
@@ -143,7 +360,7 @@ impl<T> NodeNet<T> {
         dest: &NodeId,
         body: B,
         out: &mut W,
-    ) -> Result<(), Error> {
+    ) -> Result {
         let src = &self.id;
         let response = Response { src, dest, body };
         let json = serde_json::to_string(&response)?;
@@ -171,17 +388,13 @@ impl<T> Routes<T> {
         self.0.insert(message_type.to_string(), Box::new(handler));
     }
 
-    fn handle(
-        &mut self,
-        request: &Request,
-        net: &mut NodeNet<T>,
-        state: &mut T,
-    ) -> Result<(), Error> {
+    fn handle(&mut self, request: &Request, net: &mut NodeNet<T>, state: &mut T) -> Result {
         let msg_type = &request.body.msg_type;
-        match self.0.get(msg_type) {
-            None => Ok(eprintln!("Unrecognized request type: {}", msg_type)),
-            Some(h) => h(net, state, request),
-        }
+        let handler = self
+            .0
+            .get(msg_type)
+            .ok_or_else(|| Error::maelstrom(MaelstromCode::NotSupported))?;
+        handler(net, state, request)
     }
 }
 
@@ -205,7 +418,7 @@ impl<T, C> CustomEvents<T, C> {
         }
     }
 
-    fn handle(&mut self, net: &mut NodeNet<T>, state: &mut T, event: C) -> Result<(), Error> {
+    fn handle(&mut self, net: &mut NodeNet<T>, state: &mut T, event: C) -> Result {
         let h = &self.handler;
         h(net, state, event)
     }
@@ -213,6 +426,7 @@ impl<T, C> CustomEvents<T, C> {
 
 /// Internal events
 enum Event<C> {
+    MaelstromError(MaelstromCode),
     Request(Request),
     Init(InitRequest),
     Reply(ReplyRequest),
@@ -235,19 +449,22 @@ pub struct Request {
 }
 
 impl Request {
-    /// Construct type from desierialized data of request
+    /// Construct type from desierialized body data of request
     ///
     /// Useful for implementing deserializable types that represent
     /// the payload of a particular request
-    pub fn from_data<T: DeserializeOwned>(&self) -> Result<T, Error> {
+    // TODO: rename? from_* could indicate it should consume self?
+    pub fn from_data<T: DeserializeOwned>(&self) -> std::result::Result<T, Error> {
         let value = self.body.data.clone();
         let v: Value = value.into();
-        serde_json::from_value(v).context(format!(
-            "deserializing request data failed: {:?}",
-            self.body.data
-        ))
+        serde_json::from_value(v).map_err(|e| {
+            Error::maelstrom(MaelstromCode::MalformedRequest)
+                .source(e)
+                .text("deserializing body data failed")
+        })
     }
 }
+
 impl<C> From<Request> for Event<C> {
     fn from(value: Request) -> Self {
         if value.body.msg_type == "init" {
@@ -281,9 +498,9 @@ struct Response<'a, T: Serialize> {
 
 /// A `reply` body originating from this node
 #[derive(Serialize, Debug)]
-struct ReplyBody<T: Serialize> {
+struct ReplyBody<'a, T: Serialize> {
     #[serde(rename = "type")]
-    msg_type: String,
+    msg_type: &'a str,
     msg_id: u64,
     in_reply_to: Option<u64>,
     #[serde(flatten)]
@@ -367,21 +584,28 @@ where
 
             loop {
                 buffer.clear();
-                let res = match input.read_line(&mut buffer) {
-                    // Ok(0) is EOF
-                    Ok(0) | Err(_) => input_sender.send(Event::Stop),
-                    Ok(_) => {
-                        let request = serde_json::from_slice::<Request>(buffer.as_bytes())
-                            .expect("could not deserialize request");
-                        eprintln!("Received request: {:?}", request);
-
-                        input_sender.send(request.into())
+                if (match input.read_line(&mut buffer) {
+                    Ok(0) | Err(_) => {
+                        // Ok(0) is EOF; Err is likely unrecoverable
+                        // Send one last event to stop and intentionlly break
+                        // our loop
+                        let _ = input_sender.send(Event::Stop);
+                        break;
                     }
-                };
-
-                if res.is_err() {
+                    Ok(_) => {
+                        let bytes = buffer.as_bytes();
+                        let event: Event<C> = match serde_json::from_slice::<Request>(bytes) {
+                            Ok(r) => r.into(),
+                            Err(_) => MaelstromCode::MalformedRequest.into(),
+                        };
+                        input_sender.send(event)
+                    }
+                })
+                .is_err()
+                {
+                    // Error from input handling; break loop
                     break;
-                }
+                };
             }
         });
 
@@ -397,34 +621,39 @@ where
             });
         }
 
-        fn log_if_error(result: Result<(), Error>, context: &str) {
-            match result {
-                Ok(()) => (),
-                Err(err) => eprintln!("Error handling {}: {}", context, err),
-            }
-        }
-
         // main loop for handling events in the node
         for event in &event_receiver {
             match event {
                 Event::Stop => break,
-                Event::Custom(c) => log_if_error(
-                    self.custom_events
-                        .as_mut()
-                        .expect("custom event received but no custom events registered")
-                        .handle(&mut self.net, &mut self.state, c),
-                    "custom event",
-                ),
+                Event::Custom(c) => self
+                    .custom_events
+                    .as_mut()
+                    .expect("custom event received but no custom events registered")
+                    .handle(&mut self.net, &mut self.state, c)
+                    .log("custom event handling"),
                 Event::Init(request) => {
-                    log_if_error(self.net.handle_init(&request), "initialization")
+                    if let Err(e) = self.net.handle_init(&request) {
+                        self.net
+                            .reply_err(&request.0, e)
+                            .log("init request err reply");
+                    }
                 }
                 Event::Reply(request) => {
-                    log_if_error(self.net.handle_reply(&request, &mut self.state), "reply")
+                    if let Err(e) = self.net.handle_reply(&request, &mut self.state) {
+                        self.net
+                            .reply_err(&request.0, e)
+                            .log("reply request err reply");
+                    }
                 }
-                Event::Request(request) => log_if_error(
-                    self.routes.handle(&request, &mut self.net, &mut self.state),
-                    &format!("request with type {}", request.body.msg_type),
-                ),
+                Event::Request(request) => {
+                    eprintln!("Received request: {:?}", request);
+                    if let Err(e) = self.routes.handle(&request, &mut self.net, &mut self.state) {
+                        self.net.reply_err(&request, e).log("request err reply");
+                    }
+                }
+                Event::MaelstromError(err) => {
+                    eprintln!("Error without request: {}", err)
+                }
             }
         }
     }
@@ -436,7 +665,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_routes() -> Result<(), Error> {
+    fn test_routes() -> Result {
         let mut node: Node<String, ()> =
             Node::new("".to_string()).route("echo", |_n, state, request| {
                 state.push_str(&format!("{} handled", request.body.msg_type));
@@ -459,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reply() -> Result<(), Error> {
+    fn test_reply() -> Result {
         let mut node: Node<(), ()> = Node::new(());
         node.net.id = NodeId("n1".to_string());
         let req = Request {

@@ -1,5 +1,4 @@
-use anyhow::Error;
-use gossip_glomers_rs::maelstrom::{Node, NodeId, NodeNet, Request};
+use gossip_glomers_rs::maelstrom::{Node, NodeId, NodeNet, Request, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::thread;
@@ -53,7 +52,7 @@ impl State {
         }
     }
 
-    fn handle_sync(&self, net: &mut NodeNet<State>) -> Result<(), Error> {
+    fn handle_sync(&self, net: &mut NodeNet<State>) -> Result {
         eprintln!("Outgoing messages: {:?}", self.outgoing_messages);
         for id in self.outgoing_messages.keys() {
             let msgs = self.outgoing_messages.get(id).unwrap();
@@ -76,31 +75,19 @@ impl State {
     }
 }
 
-fn handle_topology(
-    net: &mut NodeNet<State>,
-    state: &mut State,
-    request: &Request,
-) -> Result<(), Error> {
+fn handle_topology(net: &mut NodeNet<State>, state: &mut State, request: &Request) -> Result {
     let msg: TopologyMessage = request.from_data()?;
     state.topology = Some(msg.topology);
     net.ack(request)
 }
 
-fn handle_broadcast(
-    net: &mut NodeNet<State>,
-    state: &mut State,
-    request: &Request,
-) -> Result<(), Error> {
+fn handle_broadcast(net: &mut NodeNet<State>, state: &mut State, request: &Request) -> Result {
     let msg: BroadcastMessage = request.from_data()?;
     state.handle_broadcast(net, msg, &request.src);
     net.ack(request)
 }
 
-fn handle_read(
-    net: &mut NodeNet<State>,
-    state: &mut State,
-    request: &Request,
-) -> Result<(), Error> {
+fn handle_read(net: &mut NodeNet<State>, state: &mut State, request: &Request) -> Result {
     let read_response = ReadResponse {
         messages: &state.seen_messages,
     };

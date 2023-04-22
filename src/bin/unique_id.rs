@@ -1,5 +1,4 @@
-use anyhow::Error;
-use gossip_glomers_rs::maelstrom::{Node, NodeNet, Request};
+use gossip_glomers_rs::maelstrom::{Node, NodeNet, Request, Result};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -8,11 +7,7 @@ struct GenerateResponse {
     id: String,
 }
 
-fn handle_generate<T>(
-    net: &mut NodeNet<T>,
-    _state: &mut T,
-    request: &Request,
-) -> Result<(), Error> {
+fn handle_generate<T>(net: &mut NodeNet<T>, _state: &mut T, request: &Request) -> Result {
     let msg = GenerateResponse {
         id: Uuid::new_v4().to_string(),
     };
