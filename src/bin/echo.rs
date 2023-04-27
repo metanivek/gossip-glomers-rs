@@ -1,14 +1,14 @@
-use gossip_glomers_rs::maelstrom::{Node, NodeNet, Request, Result};
+use gossip_glomers_rs::maelstrom::{Message, Node, NodeNet, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
-struct EchoMessage {
+struct EchoData {
     echo: String,
 }
 
-fn handle_echo<T>(net: &mut NodeNet<T>, _state: &mut T, request: &Request) -> Result {
-    let msg: EchoMessage = request.from_data()?;
-    net.reply(request, msg)
+fn handle_echo<T>(net: &mut NodeNet<T>, _state: &mut T, message: &Message) -> Result {
+    let data: EchoData = message.parse_data()?;
+    net.reply(message, data)
 }
 
 fn main() {

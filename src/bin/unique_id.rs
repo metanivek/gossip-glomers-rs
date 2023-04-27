@@ -1,17 +1,17 @@
-use gossip_glomers_rs::maelstrom::{Node, NodeNet, Request, Result};
+use gossip_glomers_rs::maelstrom::{Message, Node, NodeNet, Result};
 use serde::Serialize;
 use uuid::Uuid;
 
 #[derive(Serialize, Debug)]
-struct GenerateResponse {
+struct GenerateData {
     id: String,
 }
 
-fn handle_generate<T>(net: &mut NodeNet<T>, _state: &mut T, request: &Request) -> Result {
-    let msg = GenerateResponse {
+fn handle_generate<T>(net: &mut NodeNet<T>, _state: &mut T, message: &Message) -> Result {
+    let data = GenerateData {
         id: Uuid::new_v4().to_string(),
     };
-    net.reply(request, msg)
+    net.reply(message, data)
 }
 
 fn main() {

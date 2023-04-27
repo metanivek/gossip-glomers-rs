@@ -1,4 +1,4 @@
-use gossip_glomers_rs::maelstrom::{Node, NodeId, NodeNet, Request, Result};
+use gossip_glomers_rs::maelstrom::{Message, Node, NodeId, NodeNet, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::thread;
@@ -7,17 +7,17 @@ use std::time::Duration;
 type Topology = HashMap<String, Vec<NodeId>>;
 
 #[derive(Serialize, Deserialize, Debug)]
-struct TopologyMessage {
+struct TopologyData {
     topology: Topology,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-struct BroadcastMessage {
+struct BroadcastData {
     message: u32,
 }
 
 #[derive(Serialize, Debug)]
-struct ReadResponse<'a> {
+struct ReadReplyData<'a> {
     messages: &'a Vec<u32>,
 }
 
@@ -30,15 +30,15 @@ struct State {
 }
 
 impl State {
-    fn handle_broadcast(&mut self, net: &NodeNet<State>, msg: BroadcastMessage, src: &NodeId) {
+    fn handle_broadcast(&mut self, net: &NodeNet<State>, data: BroadcastData, src: &NodeId) {
         // Return if we already have this message
         // since we only want to send it out when we first
         // see it
-        if self.seen_messages.contains(&msg.message) {
+        if self.seen_messages.contains(&data.message) {
             return;
         }
 
-        let message = msg.message;
+        let message = data.message;
         self.seen_messages.push(message);
 
         // Schedule for sync
@@ -57,11 +57,11 @@ impl State {
         for id in self.outgoing_messages.keys() {
             let msgs = self.outgoing_messages.get(id).unwrap();
             for msg in msgs {
-                let broadcast = BroadcastMessage { message: *msg };
+                let broadcast = BroadcastData { message: *msg };
                 {
                     let m = *msg;
                     let i = id.clone();
-                    net.send(id, "broadcast", broadcast, move |s| {
+                    net.send(id, "broadcast", broadcast, move |s, _| {
                         eprintln!("received reply from {:?} for {:?}", i, m);
                         s.outgoing_messages
                             .entry(i.clone())
@@ -75,23 +75,23 @@ impl State {
     }
 }
 
-fn handle_topology(net: &mut NodeNet<State>, state: &mut State, request: &Request) -> Result {
-    let msg: TopologyMessage = request.from_data()?;
-    state.topology = Some(msg.topology);
-    net.ack(request)
+fn handle_topology(net: &mut NodeNet<State>, state: &mut State, message: &Message) -> Result {
+    let data: TopologyData = message.parse_data()?;
+    state.topology = Some(data.topology);
+    net.ack(message)
 }
 
-fn handle_broadcast(net: &mut NodeNet<State>, state: &mut State, request: &Request) -> Result {
-    let msg: BroadcastMessage = request.from_data()?;
-    state.handle_broadcast(net, msg, &request.src);
-    net.ack(request)
+fn handle_broadcast(net: &mut NodeNet<State>, state: &mut State, message: &Message) -> Result {
+    let data: BroadcastData = message.parse_data()?;
+    state.handle_broadcast(net, data, &message.src);
+    net.ack(message)
 }
 
-fn handle_read(net: &mut NodeNet<State>, state: &mut State, request: &Request) -> Result {
-    let read_response = ReadResponse {
+fn handle_read(net: &mut NodeNet<State>, state: &mut State, message: &Message) -> Result {
+    let reply_data = ReadReplyData {
         messages: &state.seen_messages,
     };
-    net.reply(request, read_response)
+    net.reply(message, reply_data)
 }
 
 enum BroadcastEvent {

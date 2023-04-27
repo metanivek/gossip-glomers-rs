@@ -1,14 +1,16 @@
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fmt::{Debug, Display};
 use std::io::{stdin, stdout, BufRead, Write};
 
 /// Maelstrom errors
 /// https://github.com/jepsen-io/maelstrom/blob/main/resources/errors.edn
 #[repr(u16)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, IntoPrimitive, TryFromPrimitive)]
 pub enum MaelstromCode {
     /// Indicates that the requested operation could not be completed within a timeout.
     Timeout = 0,
@@ -54,12 +56,6 @@ pub enum MaelstromCode {
     TxnConflict = 30,
 }
 
-impl From<MaelstromCode> for u16 {
-    fn from(value: MaelstromCode) -> Self {
-        value as u16
-    }
-}
-
 impl<C> From<MaelstromCode> for Event<C> {
     fn from(value: MaelstromCode) -> Self {
         Event::MaelstromError(value)
@@ -101,6 +97,15 @@ impl From<ErrorCode> for u16 {
         match value {
             Maelstrom(c) => c.into(),
             Custom(c) => c,
+        }
+    }
+}
+
+impl From<u16> for ErrorCode {
+    fn from(value: u16) -> Self {
+        match MaelstromCode::try_from(value) {
+            Ok(v) => ErrorCode::Maelstrom(v),
+            Err(_) => ErrorCode::Custom(value),
         }
     }
 }
@@ -183,13 +188,13 @@ impl From<serde_json::Error> for Error {
 }
 
 /// An error message body
-#[derive(Serialize, Debug)]
-struct ErrorBody {
+#[derive(Deserialize, Serialize, Debug)]
+struct ErrorData {
     code: u16,
     text: Option<String>,
 }
 
-impl From<Error> for ErrorBody {
+impl From<Error> for ErrorData {
     fn from(value: Error) -> Self {
         Self {
             code: value.code.into(),
@@ -218,16 +223,16 @@ impl Log for Result {
 pub struct NodeId(pub String);
 
 /// Request handler for a `Node`
-pub trait Handler<T>: Fn(&mut NodeNet<T>, &mut T, &Request) -> Result {}
-impl<F, T> Handler<T> for F where F: Fn(&mut NodeNet<T>, &mut T, &Request) -> Result {}
+pub trait Handler<T>: Fn(&mut NodeNet<T>, &mut T, &Message) -> Result {}
+impl<F, T> Handler<T> for F where F: Fn(&mut NodeNet<T>, &mut T, &Message) -> Result {}
 
 /// Custom event handler a `Node`
 pub trait CustomEventHandler<T, C>: Fn(&mut NodeNet<T>, &mut T, C) -> Result {}
 impl<F, T, C> CustomEventHandler<T, C> for F where F: Fn(&mut NodeNet<T>, &mut T, C) -> Result {}
 
 /// Reply handler for a `Node` when it calls `send`
-pub trait ReplyHandler<T>: Fn(&mut T) -> Result {}
-impl<F, T> ReplyHandler<T> for F where F: Fn(&mut T) -> Result {}
+pub trait ReplyHandler<T>: Fn(&mut T, &Response) -> Result {}
+impl<F, T> ReplyHandler<T> for F where F: Fn(&mut T, &Response) -> Result {}
 
 /// A node capable of being run by maelstrom
 pub struct Node<T, C>
@@ -259,36 +264,35 @@ impl<T> NodeNet<T> {
     }
 
     /// Handles the maelstrom initialization message
-    fn handle_init(&mut self, request: &InitRequest) -> Result {
-        let request = &request.0;
-        let msg: InitMessage = request.from_data()?;
+    fn handle_init(&mut self, message: &Message) -> Result {
+        let msg: InitData = message.parse_data()?;
         self.id = msg.node_id;
         self.node_ids = msg.node_ids;
-        self.ack(request)
+        self.ack(message)
     }
 
-    /// Reply to a `request` with a simple acknowledgement
-    pub fn ack(&mut self, request: &Request) -> Result {
-        self.reply(request, Map::new())
+    /// Reply to a `message` with a simple acknowledgement
+    pub fn ack(&mut self, message: &Message) -> Result {
+        self.reply(message, Map::new())
     }
 
-    /// Reply to a `request` with a `body`
-    pub fn reply<B: Serialize + Debug>(&mut self, request: &Request, body: B) -> Result {
+    /// Reply to a `message` with a `body`
+    pub fn reply<B: Serialize + Debug>(&mut self, message: &Message, body: B) -> Result {
         let mut out = stdout();
-        self.reply_out(request, body, &mut out)
+        self.reply_out(message, body, &mut out)
     }
 
-    /// Reply to a `requst` with an `error`
-    pub fn reply_err(&mut self, request: &Request, error: Error) -> Result {
+    /// Reply to a `message` with an `error`
+    pub fn reply_err(&mut self, message: &Message, error: Error) -> Result {
         let mut out = stdout();
-        let body: ErrorBody = error.into();
-        let reply_body = ReplyBody {
-            msg_id: self.increment_msg_id(),
-            msg_type: "error",
-            in_reply_to: request.body.msg_id,
-            body,
+        let data: ErrorData = error.into();
+        let reply_body = MessageBody {
+            msg_id: Some(self.increment_msg_id()),
+            msg_type: "error".to_owned(),
+            in_reply_to: message.body.msg_id,
+            data,
         };
-        let dest = &request.src;
+        let dest = &message.src;
         self.send_out(dest, reply_body, &mut out)
     }
 
@@ -297,16 +301,18 @@ impl<T> NodeNet<T> {
         &mut self,
         dest: &NodeId,
         msg_type: &str,
-        body: B,
+        data: B,
         cb: F,
     ) -> Result {
         let mut out = stdout();
-        let send_body = SendBody {
-            msg_id: self.increment_msg_id(),
-            msg_type,
-            body,
+        let msg_id = self.increment_msg_id();
+        let send_body = MessageBody {
+            msg_id: Some(msg_id),
+            in_reply_to: None,
+            msg_type: msg_type.to_owned(),
+            data,
         };
-        self.replies.insert(send_body.msg_id, Box::new(cb));
+        self.replies.insert(msg_id, Box::new(cb));
         eprintln!("Send {:?}", send_body);
         eprintln!("Registered rplies {:?}", self.replies.keys());
         self.send_out(dest, send_body, &mut out)
@@ -315,15 +321,11 @@ impl<T> NodeNet<T> {
     /// Handles reply to this node from the network
     ///
     /// Calls a reply calllback if it was previously registered
-    fn handle_reply(&mut self, request: &ReplyRequest, state: &mut T) -> Result {
-        let in_reply_to = request.0.body.in_reply_to.ok_or_else(|| {
-            Error::maelstrom(MaelstromCode::MalformedRequest)
-                .text("reply request missing in_reply_to")
-        })?;
-        if let Some(cb) = self.replies.get(&in_reply_to) {
-            cb(state)?;
+    fn handle_reply(&mut self, message: &Message, in_reply_to: u64, state: &mut T) -> Result {
+        if let Some(cb) = self.replies.remove(&in_reply_to) {
+            let response: Response = message.clone().into();
+            cb(state, &response)?;
         }
-        self.replies.remove(&in_reply_to);
         Ok(())
     }
 
@@ -333,20 +335,20 @@ impl<T> NodeNet<T> {
         self.current_msg_id
     }
 
-    /// Reply to a `request` with a `body`, specifying output writer
-    fn reply_out<B: Serialize + Debug, W: Write>(
+    /// Reply to a `message` with a `body`, specifying output writer
+    fn reply_out<D: Serialize + Debug, W: Write>(
         &mut self,
-        request: &Request,
-        body: B,
+        message: &Message,
+        data: D,
         out: &mut W,
     ) -> Result {
-        let reply_body = ReplyBody {
-            msg_id: self.increment_msg_id(),
-            msg_type: &(request.body.msg_type.clone() + "_ok"),
-            in_reply_to: request.body.msg_id,
-            body,
+        let reply_body = MessageBody {
+            msg_id: Some(self.increment_msg_id()),
+            msg_type: message.body.msg_type.clone() + "_ok",
+            in_reply_to: message.body.msg_id,
+            data,
         };
-        let dest = &request.src;
+        let dest = &message.src;
         self.send_out(dest, reply_body, out)
     }
 
@@ -354,12 +356,16 @@ impl<T> NodeNet<T> {
     fn send_out<B: Serialize + Debug, W: Write>(
         &self,
         dest: &NodeId,
-        body: B,
+        body: MessageBody<B>,
         out: &mut W,
     ) -> Result {
-        let src = &self.id;
-        let response = Response { src, dest, body };
-        let json = serde_json::to_string(&response)?;
+        let src = self.id.clone();
+        let message = Message {
+            src,
+            dest: dest.clone(),
+            body,
+        };
+        let json = serde_json::to_string(&message)?;
 
         eprintln!("Send JSON: {}", &json);
         out.write_all((json + "\n").as_bytes())?;
@@ -384,13 +390,13 @@ impl<T> Routes<T> {
         self.0.insert(message_type.to_string(), Box::new(handler));
     }
 
-    fn handle(&mut self, request: &Request, net: &mut NodeNet<T>, state: &mut T) -> Result {
-        let msg_type = &request.body.msg_type;
+    fn handle(&mut self, message: &Message, net: &mut NodeNet<T>, state: &mut T) -> Result {
+        let msg_type = &message.body.msg_type;
         let handler = self
             .0
             .get(msg_type)
             .ok_or_else(|| Error::maelstrom(MaelstromCode::NotSupported))?;
-        handler(net, state, request)
+        handler(net, state, message)
     }
 }
 
@@ -422,35 +428,48 @@ impl<T, C> CustomEvents<T, C> {
 
 /// Internal events
 enum Event<C> {
+    Init(Message),
     MaelstromError(MaelstromCode),
-    Request(Request),
-    Init(InitRequest),
-    Reply(ReplyRequest),
+    Request(Message),
+    Reply(Message, u64),
     Custom(C),
     Stop,
 }
 
-/// An initialization request
-struct InitRequest(Request);
-
-/// A reply request received from the Maelstrom network
-struct ReplyRequest(Request);
-
-/// A request from the Maelstrom network
+/// The data of an initialization message
 #[derive(Deserialize, Debug)]
-pub struct Request {
-    pub src: NodeId,
-    pub dest: NodeId,
-    pub body: RequestBody,
+struct InitData {
+    node_id: NodeId,
+    node_ids: Vec<NodeId>,
 }
 
-impl Request {
-    /// Construct type from desierialized body data of request
+/// A message in the Maelstrom network
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Message<T = Map<String, Value>>
+where
+    T: Serialize,
+{
+    pub src: NodeId,
+    pub dest: NodeId,
+    pub body: MessageBody<T>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct MessageBody<T: Serialize> {
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    pub msg_id: Option<u64>,
+    pub in_reply_to: Option<u64>,
+    #[serde(flatten)]
+    pub data: T,
+}
+
+impl Message {
+    /// Parse body data into custom type `T`
     ///
     /// Useful for implementing deserializable types that represent
     /// the payload of a particular request
-    // TODO: rename? from_* could indicate it should consume self?
-    pub fn from_data<T: DeserializeOwned>(&self) -> std::result::Result<T, Error> {
+    pub fn parse_data<T: DeserializeOwned>(&self) -> std::result::Result<T, Error> {
         let value = self.body.data.clone();
         let v: Value = value.into();
         serde_json::from_value(v).map_err(|e| {
@@ -461,63 +480,41 @@ impl Request {
     }
 }
 
-impl<C> From<Request> for Event<C> {
-    fn from(value: Request) -> Self {
-        if value.body.msg_type == "init" {
-            Event::Init(InitRequest(value))
-        } else if value.body.in_reply_to.is_some() {
-            Event::Reply(ReplyRequest(value))
+/// A response to a request originating from this node
+pub type Response = std::result::Result<Message, Error>;
+
+impl From<Message> for Response {
+    fn from(value: Message) -> Self {
+        if value.body.msg_type == "error" {
+            Response::Err(value.parse_data::<ErrorData>().map_or_else(
+                |err| {
+                    Error::maelstrom(MaelstromCode::MalformedRequest)
+                        .text("error body could not deserialize")
+                        .source(err)
+                },
+                |body| Error {
+                    code: body.code.into(),
+                    text: body.text,
+                    source: None,
+                },
+            ))
         } else {
-            Event::Request(value)
+            Response::Ok(value)
         }
     }
 }
 
-/// A request body
-#[derive(Deserialize, Debug)]
-pub struct RequestBody {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    pub msg_id: Option<u64>,
-    pub in_reply_to: Option<u64>,
-    #[serde(flatten)]
-    pub data: Map<String, Value>,
-}
-
-/// A response from the Maelstrom network
-#[derive(Serialize, Debug)]
-struct Response<'a, T: Serialize> {
-    src: &'a NodeId,
-    dest: &'a NodeId,
-    body: T,
-}
-
-/// A `reply` body originating from this node
-#[derive(Serialize, Debug)]
-struct ReplyBody<'a, T: Serialize> {
-    #[serde(rename = "type")]
-    msg_type: &'a str,
-    msg_id: u64,
-    in_reply_to: Option<u64>,
-    #[serde(flatten)]
-    body: T,
-}
-
-/// A `send` body
-#[derive(Serialize, Debug)]
-struct SendBody<'a, T: Serialize> {
-    #[serde(rename = "type")]
-    msg_type: &'a str,
-    msg_id: u64,
-    #[serde(flatten)]
-    body: T,
-}
-
-/// The body of an `InitRequest`
-#[derive(Deserialize, Debug)]
-struct InitMessage {
-    node_id: NodeId,
-    node_ids: Vec<NodeId>,
+impl<C> From<Message> for Event<C> {
+    fn from(value: Message) -> Self {
+        if value.body.msg_type == "init" {
+            Event::Init(value)
+        } else if value.body.in_reply_to.is_some() {
+            let in_reply_to = value.body.in_reply_to.unwrap();
+            Event::Reply(value, in_reply_to)
+        } else {
+            Event::Request(value)
+        }
+    }
 }
 
 /// A default `Node` with `()` as its state
@@ -590,7 +587,7 @@ where
                     }
                     Ok(_) => {
                         let bytes = buffer.as_bytes();
-                        let event: Event<C> = match serde_json::from_slice::<Request>(bytes) {
+                        let event: Event<C> = match serde_json::from_slice::<Message>(bytes) {
                             Ok(r) => r.into(),
                             Err(_) => MaelstromCode::MalformedRequest.into(),
                         };
@@ -627,24 +624,27 @@ where
                     .expect("custom event received but no custom events registered")
                     .handle(&mut self.net, &mut self.state, c)
                     .log("custom event handling"),
-                Event::Init(request) => {
-                    if let Err(e) = self.net.handle_init(&request) {
+                Event::Init(message) => {
+                    if let Err(e) = self.net.handle_init(&message) {
                         self.net
-                            .reply_err(&request.0, e)
+                            .reply_err(&message, e)
                             .log("init request err reply");
                     }
                 }
-                Event::Reply(request) => {
-                    if let Err(e) = self.net.handle_reply(&request, &mut self.state) {
+                Event::Reply(message, in_reply_to) => {
+                    if let Err(e) = self
+                        .net
+                        .handle_reply(&message, in_reply_to, &mut self.state)
+                    {
                         self.net
-                            .reply_err(&request.0, e)
+                            .reply_err(&message, e)
                             .log("reply request err reply");
                     }
                 }
-                Event::Request(request) => {
-                    eprintln!("Received request: {:?}", request);
-                    if let Err(e) = self.routes.handle(&request, &mut self.net, &mut self.state) {
-                        self.net.reply_err(&request, e).log("request err reply");
+                Event::Request(message) => {
+                    eprintln!("Received request: {:?}", message);
+                    if let Err(e) = self.routes.handle(&message, &mut self.net, &mut self.state) {
+                        self.net.reply_err(&message, e).log("request err reply");
                     }
                 }
                 Event::MaelstromError(err) => {
@@ -667,10 +667,10 @@ mod tests {
                 state.push_str(&format!("{} handled", request.body.msg_type));
                 Ok(())
             });
-        let request = Request {
+        let message = Message {
             src: NodeId("c1".to_string()),
             dest: NodeId("n1".to_string()),
-            body: RequestBody {
+            body: MessageBody {
                 msg_type: "echo".to_string(),
                 msg_id: None,
                 in_reply_to: None,
@@ -678,7 +678,7 @@ mod tests {
             },
         };
         node.routes
-            .handle(&request, &mut node.net, &mut node.state)?;
+            .handle(&message, &mut node.net, &mut node.state)?;
         assert_eq!("echo handled".to_string(), *node.state);
         Ok(())
     }
@@ -687,10 +687,10 @@ mod tests {
     fn test_reply() -> Result {
         let mut node: Node<(), ()> = Node::new(());
         node.net.id = NodeId("n1".to_string());
-        let req = Request {
+        let message = Message {
             src: NodeId("c1".to_string()),
             dest: node.net.id.clone(),
-            body: RequestBody {
+            body: MessageBody {
                 msg_type: "test".to_string(),
                 msg_id: Some(1),
                 in_reply_to: None,
@@ -704,7 +704,8 @@ mod tests {
         }
 
         let mut out: Vec<u8> = Vec::new();
-        node.net.reply_out(&req, Stuff { hello: 42 }, &mut out)?;
+        node.net
+            .reply_out(&message, Stuff { hello: 42 }, &mut out)?;
         let expected = r#"{"src":"n1","dest":"c1","body":{"type":"test_ok","msg_id":1,"in_reply_to":1,"hello":42}}"#
             .as_bytes();
         assert_eq!(expected, &out[..(out.len() - 1)]);
