@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Display};
 use std::io::{stdin, stdout, BufRead, Write};
+use std::str::FromStr;
 
 /// Maelstrom errors
 /// https://github.com/jepsen-io/maelstrom/blob/main/resources/errors.edn
@@ -241,6 +242,132 @@ where
     net: NodeNet<T>,
     routes: Routes<T>,
     custom_events: Option<CustomEvents<T, C>>,
+}
+
+/// Key-value stores offered by Maelstrom
+/// [See docs for more info](https://github.com/jepsen-io/maelstrom/blob/main/doc/services.md)
+pub enum KVService {
+    /// A linearalizable key-value store
+    Lin,
+    /// A sequentially consistent key-value store.
+    Seq,
+    /// An intentionally pathological last-write-wins key-value store.
+    Lww,
+}
+
+impl From<KVService> for NodeId {
+    fn from(value: KVService) -> Self {
+        NodeId(
+            match value {
+                KVService::Lin => "lin-kv",
+                KVService::Seq => "seq-kv",
+                KVService::Lww => "lww-kv",
+            }
+            .to_owned(),
+        )
+    }
+}
+
+/// Key-value service extensions
+pub trait KV<T> {
+    fn read<V, F>(&mut self, service: KVService, key: &str, cb: F) -> Result
+    where
+        V: FromStr,
+        F: Handler<T, std::result::Result<V, Error>> + 'static;
+    fn write<V>(&mut self, service: KVService, key: &str, value: V) -> Result
+    where
+        V: Serialize + Debug;
+    fn compare_and_swap<V>(
+        &mut self,
+        service: KVService,
+        key: &str,
+        from: V,
+        to: V,
+        create_if_not_exists: bool,
+    ) -> Result
+    where
+        V: Serialize + Debug;
+}
+
+impl<T> KV<T> for NodeNet<T> {
+    fn read<V, F>(&mut self, service: KVService, key: &str, cb: F) -> Result
+    where
+        V: FromStr,
+        F: Handler<T, std::result::Result<V, Error>> + 'static,
+    {
+        #[derive(Serialize, Debug)]
+        struct ReadData<'a> {
+            key: &'a str,
+        }
+
+        #[derive(Deserialize)]
+        struct ReadReplyData {
+            value: String,
+        }
+
+        self.send(
+            &service.into(),
+            "read",
+            ReadData { key },
+            move |net, state, resp| {
+                let res = resp
+                    .and_then(|msg| msg.parse_data::<ReadReplyData>())
+                    .and_then(|data| {
+                        data.value.parse::<V>().map_err(|_err| {
+                            Error::maelstrom(MaelstromCode::Crash)
+                                .text("Could not parse KV read reply value")
+                        })
+                    });
+                cb(net, state, res)
+            },
+        )
+    }
+    fn write<V>(&mut self, service: KVService, key: &str, value: V) -> Result
+    where
+        V: Serialize + Debug,
+    {
+        #[derive(Serialize, Debug)]
+        struct WriteData<'a, V> {
+            key: &'a str,
+            value: V,
+        }
+        self.send(
+            &service.into(),
+            "write",
+            WriteData { key, value },
+            |_, _, _| Ok(()),
+        )
+    }
+    fn compare_and_swap<V>(
+        &mut self,
+        service: KVService,
+        key: &str,
+        from: V,
+        to: V,
+        create_if_not_exists: bool,
+    ) -> Result
+    where
+        V: Serialize + Debug,
+    {
+        #[derive(Serialize, Debug)]
+        struct CASData<'a, V> {
+            key: &'a str,
+            from: V,
+            to: V,
+            create_if_not_exists: bool,
+        }
+        self.send(
+            &service.into(),
+            "cas",
+            CASData {
+                key,
+                from,
+                to,
+                create_if_not_exists,
+            },
+            |_, _, _| Ok(()),
+        )
+    }
 }
 
 /// For interacting with the `Node`'s maelstrom network
