@@ -61,7 +61,7 @@ impl State {
                 {
                     let m = *msg;
                     let i = id.clone();
-                    net.send(id, "broadcast", broadcast, move |s, _| {
+                    net.send(id, "broadcast", broadcast, move |_, s, _| {
                         eprintln!("received reply from {:?} for {:?}", i, m);
                         s.outgoing_messages
                             .entry(i.clone())

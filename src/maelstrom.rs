@@ -222,17 +222,15 @@ impl Log for Result {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeId(pub String);
 
-/// Request handler for a `Node`
-pub trait Handler<T>: Fn(&mut NodeNet<T>, &mut T, &Message) -> Result {}
-impl<F, T> Handler<T> for F where F: Fn(&mut NodeNet<T>, &mut T, &Message) -> Result {}
-
-/// Custom event handler a `Node`
-pub trait CustomEventHandler<T, C>: Fn(&mut NodeNet<T>, &mut T, C) -> Result {}
-impl<F, T, C> CustomEventHandler<T, C> for F where F: Fn(&mut NodeNet<T>, &mut T, C) -> Result {}
-
-/// Reply handler for a `Node` when it calls `send`
-pub trait ReplyHandler<T>: Fn(&mut T, &Response) -> Result {}
-impl<F, T> ReplyHandler<T> for F where F: Fn(&mut T, &Response) -> Result {}
+/// A generic handler function for node activity
+pub trait Handler<T, P>: Fn(&mut NodeNet<T>, &mut T, P) -> Result {}
+impl<F, T, P> Handler<T, P> for F where F: Fn(&mut NodeNet<T>, &mut T, P) -> Result {}
+/// A handler used by registered routes to handle incoming messages
+pub trait RouteHandler<T>: for<'a> Handler<T, &'a Message> {}
+impl<F, T> RouteHandler<T> for F where F: for<'a> Fn(&mut NodeNet<T>, &mut T, &'a Message) -> Result {}
+/// A handler used by nodes to handle replies to outgoing messages sent by the node
+pub trait ReplyHandler<T>: Handler<T, Response> {}
+impl<F, T> ReplyHandler<T> for F where F: Fn(&mut NodeNet<T>, &mut T, Response) -> Result {}
 
 /// A node capable of being run by maelstrom
 pub struct Node<T, C>
@@ -318,15 +316,9 @@ impl<T> NodeNet<T> {
         self.send_out(dest, send_body, &mut out)
     }
 
-    /// Handles reply to this node from the network
-    ///
-    /// Calls a reply calllback if it was previously registered
-    fn handle_reply(&mut self, message: &Message, in_reply_to: u64, state: &mut T) -> Result {
-        if let Some(cb) = self.replies.remove(&in_reply_to) {
-            let response: Response = message.clone().into();
-            cb(state, &response)?;
-        }
-        Ok(())
+    /// Take reply handler for specified message id
+    fn take_reply_handler(&mut self, in_reply_to: u64) -> Option<Box<dyn ReplyHandler<T>>> {
+        self.replies.remove(&in_reply_to)
     }
 
     /// Increment global message id for the node
@@ -376,16 +368,16 @@ impl<T> NodeNet<T> {
 }
 
 /// Registered routes for a `Node`
-struct Routes<T>(HashMap<String, Box<dyn Handler<T>>>);
+struct Routes<T>(HashMap<String, Box<dyn RouteHandler<T>>>);
 
 impl<T> Routes<T> {
     fn new() -> Self {
         Self(HashMap::new())
     }
 
-    fn add<F>(&mut self, message_type: &str, handler: F)
+    fn add<'a, F>(&mut self, message_type: &str, handler: F)
     where
-        F: Handler<T> + 'static,
+        F: RouteHandler<T> + 'static,
     {
         self.0.insert(message_type.to_string(), Box::new(handler));
     }
@@ -403,14 +395,14 @@ impl<T> Routes<T> {
 /// Registered custom events for a `Node`
 struct CustomEvents<T, C> {
     receiver: Receiver<C>,
-    handler: Box<dyn CustomEventHandler<T, C>>,
+    handler: Box<dyn Handler<T, C>>,
 }
 
 impl<T, C> CustomEvents<T, C> {
     fn new<F, H>(init: F, handler: H) -> Self
     where
         F: FnOnce(Sender<C>) + 'static,
-        H: CustomEventHandler<T, C> + 'static,
+        H: Handler<T, C> + 'static,
     {
         let (sender, receiver) = unbounded();
         init(sender);
@@ -544,7 +536,7 @@ where
     /// Add route to a `Node` for handling a `message_type`
     pub fn route<F>(mut self, message_type: &str, handler: F) -> Self
     where
-        F: Handler<T> + 'static,
+        F: RouteHandler<T> + 'static,
     {
         self.routes.add(message_type, handler);
         self
@@ -556,7 +548,7 @@ where
     pub fn custom_events<F, H>(mut self, init: F, handler: H) -> Self
     where
         F: FnOnce(Sender<C>) + 'static,
-        H: CustomEventHandler<T, C> + 'static,
+        H: Handler<T, C> + 'static,
     {
         if self.custom_events.is_some() {
             panic!("There is already a custom events sender registered.")
@@ -632,13 +624,16 @@ where
                     }
                 }
                 Event::Reply(message, in_reply_to) => {
-                    if let Err(e) = self
-                        .net
-                        .handle_reply(&message, in_reply_to, &mut self.state)
-                    {
-                        self.net
-                            .reply_err(&message, e)
-                            .log("reply request err reply");
+                    match self.net.take_reply_handler(in_reply_to) {
+                        None => eprintln!("No reply handler for msg id {}", in_reply_to),
+                        Some(h) => {
+                            let response: Response = message.clone().into();
+                            if let Err(e) = h(&mut self.net, &mut self.state, response) {
+                                self.net
+                                    .reply_err(&message, e)
+                                    .log("reply request err reply");
+                            }
+                        }
                     }
                 }
                 Event::Request(message) => {
