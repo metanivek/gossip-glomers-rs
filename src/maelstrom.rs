@@ -123,7 +123,7 @@ impl Display for ErrorCode {
 
 #[derive(Debug)]
 pub struct Error {
-    code: ErrorCode,
+    pub code: ErrorCode,
     text: Option<String>,
     source: Option<Box<dyn std::error::Error + 'static>>,
     // TODO: support extra key-value data in an error
@@ -270,30 +270,43 @@ impl From<KVService> for NodeId {
 
 /// Key-value service extensions
 pub trait KV<T> {
-    fn read<V, F>(&mut self, service: KVService, key: &str, cb: F) -> Result
+    fn read<V>(
+        &mut self,
+        service: KVService,
+        key: &str,
+        cb: impl Handler<T, std::result::Result<V, Error>> + 'static,
+    ) -> Result
     where
-        V: FromStr,
-        F: Handler<T, std::result::Result<V, Error>> + 'static;
-    fn write<V>(&mut self, service: KVService, key: &str, value: V) -> Result
+        V: FromStr + for<'a> Deserialize<'a>;
+
+    fn write<V, F>(&mut self, service: KVService, key: &str, value: V, cb: F) -> Result
     where
-        V: Serialize + Debug;
-    fn compare_and_swap<V>(
+        V: Serialize + Debug,
+        F: ReplyHandler<T> + 'static;
+
+    fn compare_and_swap<V, F>(
         &mut self,
         service: KVService,
         key: &str,
         from: V,
         to: V,
         create_if_not_exists: bool,
+        cb: F,
     ) -> Result
     where
-        V: Serialize + Debug;
+        V: Serialize + Debug,
+        F: ReplyHandler<T> + 'static;
 }
 
 impl<T> KV<T> for NodeNet<T> {
-    fn read<V, F>(&mut self, service: KVService, key: &str, cb: F) -> Result
+    fn read<V>(
+        &mut self,
+        service: KVService,
+        key: &str,
+        cb: impl Handler<T, std::result::Result<V, Error>> + 'static,
+    ) -> Result
     where
-        V: FromStr,
-        F: Handler<T, std::result::Result<V, Error>> + 'static,
+        V: FromStr + for<'a> Deserialize<'a>,
     {
         #[derive(Serialize, Debug)]
         struct ReadData<'a> {
@@ -301,8 +314,15 @@ impl<T> KV<T> for NodeNet<T> {
         }
 
         #[derive(Deserialize)]
-        struct ReadReplyData {
-            value: String,
+        #[serde(untagged)]
+        enum Value<V> {
+            Raw(V),
+            String(String),
+        }
+
+        #[derive(Deserialize)]
+        struct ReadReplyData<V> {
+            value: Value<V>,
         }
 
         self.send(
@@ -311,43 +331,43 @@ impl<T> KV<T> for NodeNet<T> {
             ReadData { key },
             move |net, state, resp| {
                 let res = resp
-                    .and_then(|msg| msg.parse_data::<ReadReplyData>())
-                    .and_then(|data| {
-                        data.value.parse::<V>().map_err(|_err| {
+                    .and_then(|msg| msg.parse_data::<ReadReplyData<V>>())
+                    .and_then(|data| match data.value {
+                        // TODO: what happens if V is String ?
+                        Value::Raw(v) => Ok(v),
+                        Value::String(s) => s.parse::<V>().map_err(|_err| {
                             Error::maelstrom(MaelstromCode::Crash)
                                 .text("Could not parse KV read reply value")
-                        })
+                        }),
                     });
                 cb(net, state, res)
             },
         )
     }
-    fn write<V>(&mut self, service: KVService, key: &str, value: V) -> Result
+    fn write<V, F>(&mut self, service: KVService, key: &str, value: V, cb: F) -> Result
     where
         V: Serialize + Debug,
+        F: ReplyHandler<T> + 'static,
     {
         #[derive(Serialize, Debug)]
         struct WriteData<'a, V> {
             key: &'a str,
             value: V,
         }
-        self.send(
-            &service.into(),
-            "write",
-            WriteData { key, value },
-            |_, _, _| Ok(()),
-        )
+        self.send(&service.into(), "write", WriteData { key, value }, cb)
     }
-    fn compare_and_swap<V>(
+    fn compare_and_swap<V, F>(
         &mut self,
         service: KVService,
         key: &str,
         from: V,
         to: V,
         create_if_not_exists: bool,
+        cb: F,
     ) -> Result
     where
         V: Serialize + Debug,
+        F: ReplyHandler<T> + 'static,
     {
         #[derive(Serialize, Debug)]
         struct CASData<'a, V> {
@@ -365,7 +385,7 @@ impl<T> KV<T> for NodeNet<T> {
                 to,
                 create_if_not_exists,
             },
-            |_, _, _| Ok(()),
+            cb,
         )
     }
 }
@@ -438,8 +458,6 @@ impl<T> NodeNet<T> {
             data,
         };
         self.replies.insert(msg_id, Box::new(cb));
-        eprintln!("Send {:?}", send_body);
-        eprintln!("Registered rplies {:?}", self.replies.keys());
         self.send_out(dest, send_body, &mut out)
     }
 
@@ -751,6 +769,7 @@ where
                     }
                 }
                 Event::Reply(message, in_reply_to) => {
+                    eprintln!("Received reply: {:?}", message);
                     match self.net.take_reply_handler(in_reply_to) {
                         None => eprintln!("No reply handler for msg id {}", in_reply_to),
                         Some(h) => {
