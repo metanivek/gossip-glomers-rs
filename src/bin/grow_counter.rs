@@ -13,7 +13,7 @@ struct ReadReplyData {
     value: u64,
 }
 
-const KEY: &'static str = "grow_counter";
+const KEY: &str = "grow_counter";
 const SERVICE: KVService = KVService::Seq;
 
 fn increment<F>(net: &mut NodeNet<()>, delta: u64, finished: F) -> Result

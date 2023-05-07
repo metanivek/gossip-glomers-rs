@@ -520,7 +520,7 @@ impl<T> Routes<T> {
         Self(HashMap::new())
     }
 
-    fn add<'a, F>(&mut self, message_type: &str, handler: F)
+    fn add<F>(&mut self, message_type: &str, handler: F)
     where
         F: RouteHandler<T> + 'static,
     {
