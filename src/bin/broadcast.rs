@@ -64,7 +64,7 @@ impl State {
                     net.send(id, "broadcast", broadcast, move |_, s, _| {
                         eprintln!("received reply from {:?} for {:?}", i, m);
                         s.outgoing_messages
-                            .entry(i.clone())
+                            .entry(i)
                             .and_modify(|msgs| msgs.retain(|msg| msg != &m));
                         Ok(())
                     })?;

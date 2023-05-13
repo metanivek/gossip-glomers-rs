@@ -18,12 +18,11 @@ const SERVICE: KVService = KVService::Seq;
 
 fn increment<F>(net: &mut NodeNet<()>, delta: u64, finished: F) -> Result
 where
-    F: Fn(&mut NodeNet<()>, Result) -> Result + Clone + 'static,
+    F: Fn(&mut NodeNet<()>, Result) -> Result + 'static,
 {
     net.read::<u64>(SERVICE, KEY, move |net, _state, resp| match resp {
         Ok(value) => {
             let new_value = value + delta;
-            let finished = finished.clone();
             net.compare_and_swap(
                 SERVICE,
                 KEY,
@@ -35,7 +34,7 @@ where
                     Err(err) => match err.code {
                         ErrorCode::Maelstrom(MaelstromCode::PreconditionFailed) => {
                             // try again!
-                            increment(net, delta, finished.clone())
+                            increment(net, delta, finished)
                         }
                         _ => finished(net, Err(err)),
                     },
@@ -44,7 +43,6 @@ where
         }
         Err(err) => match err.code {
             ErrorCode::Maelstrom(MaelstromCode::KeyDoesNotExist) => {
-                let finished = finished.clone();
                 net.write(SERVICE, KEY, delta, move |net, _, resp| {
                     finished(net, resp.map(|_| ()))
                 })
