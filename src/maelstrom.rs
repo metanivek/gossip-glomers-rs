@@ -223,15 +223,17 @@ impl Log for Result {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeId(pub String);
 
-/// A generic handler function for node activity
+/// Generic handlers for node activity
+pub trait HandlerOnce<T, P>: FnOnce(&mut NodeNet<T>, &mut T, P) -> Result {}
+impl<F, T, P> HandlerOnce<T, P> for F where F: FnOnce(&mut NodeNet<T>, &mut T, P) -> Result {}
 pub trait Handler<T, P>: Fn(&mut NodeNet<T>, &mut T, P) -> Result {}
 impl<F, T, P> Handler<T, P> for F where F: Fn(&mut NodeNet<T>, &mut T, P) -> Result {}
 /// A handler used by registered routes to handle incoming messages
 pub trait RouteHandler<T>: for<'a> Handler<T, &'a Message> {}
 impl<F, T> RouteHandler<T> for F where F: for<'a> Fn(&mut NodeNet<T>, &mut T, &'a Message) -> Result {}
 /// A handler used by nodes to handle replies to outgoing messages sent by the node
-pub trait ReplyHandler<T>: Handler<T, Response> {}
-impl<F, T> ReplyHandler<T> for F where F: Fn(&mut NodeNet<T>, &mut T, Response) -> Result {}
+pub trait ReplyHandler<T>: HandlerOnce<T, Response> {}
+impl<F, T> ReplyHandler<T> for F where F: FnOnce(&mut NodeNet<T>, &mut T, Response) -> Result {}
 
 /// A node capable of being run by maelstrom
 pub struct Node<T, C>
@@ -246,6 +248,7 @@ where
 
 /// Key-value stores offered by Maelstrom
 /// [See docs for more info](https://github.com/jepsen-io/maelstrom/blob/main/doc/services.md)
+#[derive(Copy, Clone)]
 pub enum KVService {
     /// A linearalizable key-value store
     Lin,
@@ -274,7 +277,7 @@ pub trait KV<T> {
         &mut self,
         service: KVService,
         key: &str,
-        cb: impl Handler<T, std::result::Result<V, Error>> + 'static,
+        cb: impl HandlerOnce<T, std::result::Result<V, Error>> + 'static,
     ) -> Result
     where
         V: FromStr + for<'a> Deserialize<'a>;
@@ -303,7 +306,7 @@ impl<T> KV<T> for NodeNet<T> {
         &mut self,
         service: KVService,
         key: &str,
-        cb: impl Handler<T, std::result::Result<V, Error>> + 'static,
+        cb: impl HandlerOnce<T, std::result::Result<V, Error>> + 'static,
     ) -> Result
     where
         V: FromStr + for<'a> Deserialize<'a>,
